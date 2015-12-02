@@ -54,6 +54,7 @@ namespace details {
             }
 
             bucket.push_back(std::make_tuple(hash, rec));
+            m_size++;
             return true;
         }
 
@@ -110,9 +111,9 @@ namespace details {
     private:
         const std::hash<key_type> m_hasher = {};
         const hash_type max_hash = std::numeric_limits<hash_type>::max();
+        bucket_storage_type m_buckets = bucket_storage_type(1);
         float m_rehash_threshold = 2.0f;
         size_t m_size;
-        bucket_storage_type m_buckets = bucket_storage_type(1);
 
     private:
         template< typename F > // Functor: Fn<auto (record_type *rec)>
