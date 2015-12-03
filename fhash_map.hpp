@@ -109,8 +109,8 @@ namespace details {
         }
 
     private:
+        // if there will be integer type, i'll have to use better hash
         const std::hash<key_type> m_hasher = {};
-        const hash_type max_hash = std::numeric_limits<hash_type>::max();
         bucket_storage_type m_buckets = bucket_storage_type(1);
         float m_rehash_threshold = 2.0f;
         size_t m_size;
@@ -157,8 +157,7 @@ namespace details {
 
         size_t calc_bucket_number(const hash_type hash) const {
             assert(bucket_count() != 0);
-            auto bucket_coefficient = static_cast<double>(bucket_count()) / max_hash;
-            auto bucket_number = static_cast<size_t>(hash * bucket_coefficient);
+            auto bucket_number = hash % bucket_count();
             assert(bucket_number < bucket_count());
             return bucket_number;
         }
