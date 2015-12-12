@@ -1,11 +1,15 @@
 TEMPLATE = app
-CONFIG += console
-CONFIG += c++11
+CONFIG += console c++11
 CONFIG -= app_bundle
 CONFIG -= qt
 
 SOURCES += main.cpp
 
 HEADERS += \
-    fhash_map.hpp
+    binstreamwrap.hpp \
+    binstreamwrapfwd.hpp \
+    hash_file_storage.hpp
 
+LIBPATH += /usr/local/lib/
+LIBS += $${LIBPATH}libboost_system.a \
+    $${LIBPATH}libboost_filesystem.a
