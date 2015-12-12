@@ -504,6 +504,14 @@ public:
         return m_index.has(key);
     }
 
+    size_t size() const {
+        return m_index.size();
+    }
+
+    bool empty() const {
+        return size() == 0;
+    }
+
 private:
     index_t m_index;
     storage_t m_storage;
