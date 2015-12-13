@@ -20,8 +20,7 @@ namespace fcl {
 #endif
 
 
-class ReadingAtEOF : public std::exception
-{
+class ReadingAtEOF : public std::exception {
 public:
     virtual const char *what() const noexcept override final {
         return "attempt to read at eof";
@@ -145,8 +144,31 @@ public:
         return is;
     }
 
+    template <typename T, uint64_t I>
+    friend auto operator >>(BinIStreamWrap &is, T (&t)[I])
+        -> typename std::enable_if<std::is_trivially_copyable<T>::value, BinIStreamWrap &>::type {
+        is.m_istr.read(reinterpret_cast<char *>(t), sizeof(T) * I);
+        if (is.m_istr.eof() && is.m_useExceptions) {
+            throw ReadingAtEOF();
+        }
+        return is;
+    }
+
+    template <typename T, uint64_t I>
+    friend auto operator >>(BinIStreamWrap &is, T (&t)[I])
+        -> typename std::enable_if<!std::is_trivially_copyable<T>::value, BinIStreamWrap &>::type {
+        for (auto &el : t) {
+            is >> el;
+            if (is.m_istr.eof() && is.m_useExceptions) {
+                throw ReadingAtEOF();
+            }
+        }
+        return is;
+    }
+
     template <typename T, typename Alloc>
-    friend BinIStreamWrap &operator >>(BinIStreamWrap &is, std::vector<T, Alloc> &vec) {
+    friend auto operator >>(BinIStreamWrap &is, std::vector<T, Alloc> &vec)
+        -> typename std::enable_if<std::is_trivially_copyable<T>::value, BinIStreamWrap &>::type {
         uint64_t size;
         is >> size;
         vec.resize(static_cast<size_t>(size));
@@ -162,6 +184,22 @@ public:
     }
 
     template <typename T, typename Alloc>
+    friend auto operator >>(BinIStreamWrap &is, std::vector<T, Alloc> &vec)
+        -> typename std::enable_if<!std::is_trivially_copyable<T>::value, BinIStreamWrap &>::type {
+        uint64_t size;
+        is >> size;
+        vec.resize(static_cast<size_t>(size));
+
+        for (auto &el : vec) {
+            is >> el;
+            if (is.m_istr.eof() && is.m_useExceptions) {
+                throw ReadingAtEOF();
+            }
+        }
+        return is;
+    }
+
+    template <typename T, typename Alloc>
     friend BinIStreamWrap &operator >>(BinIStreamWrap &is, std::list< T, Alloc > &list) {
         uint64_t size;
         is >> size;
@@ -169,6 +207,9 @@ public:
 
         for (auto &el: list) {
             is >> el;
+        }
+        if (is.m_istr.eof() && is.m_useExceptions) {
+            throw ReadingAtEOF();
         }
 
         return is;
@@ -193,6 +234,7 @@ public:
     }
 
 #ifdef QT_VERSION
+
     friend BinIStreamWrap &operator >>(BinIStreamWrap &is, QString &str) {
         int32_t size;
         is >> size;
@@ -324,10 +366,34 @@ public:
         (*this) << val;
     }
 
+    template <typename Ty>
+    int64_t append(const Ty &var) {
+        goto_oend();
+        auto pos = get_opos();
+        (*this) << var;
+        return pos;
+    }
+
     template <typename T>
     friend BinOStreamWrap &operator <<(BinOStreamWrap &os, const T &t) {
         static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
         os.m_ostr.write(reinterpret_cast<const char *>(&t), sizeof(t));
+        return os;
+    }
+
+    template <typename T, uint64_t I>
+    friend auto operator <<(BinOStreamWrap &os, const T (&array)[I])
+        -> typename std::enable_if<std::is_trivially_copyable<T>::value, BinOStreamWrap &>::type {
+        os.m_ostr.write(reinterpret_cast<const char *>(array), sizeof(T) * I);
+        return os;
+    }
+
+    template <typename T, uint64_t I>
+    friend auto operator <<(BinOStreamWrap &os, const T (&array)[I])
+        -> typename std::enable_if<!std::is_trivially_copyable<T>::value, BinOStreamWrap &>::type {
+        for (auto &el : array) {
+            os << el;
+        }
         return os;
     }
 

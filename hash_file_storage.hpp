@@ -10,19 +10,16 @@
 #include <boost/optional.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/variant.hpp>
+#include <boost/tuple/tuple.hpp>
+
+#define WHEELS_HAS_FEATURE_CXX_ALIGNED_UNION
+#include <wheels/scope.h++>
 
 #include "binstreamwrap.hpp"
 
 
 namespace details {
     namespace fs = boost::filesystem;
-
-    class CorruptedFile : public std::exception {
-    public:
-        virtual const char *what() const noexcept override {
-            return "i/o file corrupted!";
-        }
-    };
 
     class CannotOpenFile : public std::exception {
     public:
@@ -36,7 +33,7 @@ namespace details {
         const std::string m_message;
     };
 
-    namespace cell_state {
+    namespace seg_state {
         constexpr char dead = 'd';
         constexpr char alive = 'a';
         constexpr char empty = 'e';
@@ -64,12 +61,14 @@ namespace details {
         }
     }
 
-    template <typename Key, typename Value>
+    template <typename Key, typename Value, uint64_t PageLength>
     class FileHashIndex {
         static_assert(
             std::is_trivially_copyable<Value>::value,
             "Value have to be trivially copyable"
         );
+
+        static_assert(PageLength >= 1, "page length cannot be less than 1");
 
         using key_t = Key;
         using hash_t = uint64_t;
@@ -81,11 +80,36 @@ namespace details {
         using bin_stream_t = fcl::BinIOStreamWrap<std::fstream>;
         using key_info_t = std::pair<hash_t, pos_t>;
         using key_variant_t = boost::variant<key_t, key_info_t>;
-        // bucket cell structure:
-        // [state_t(state e/a/d) | hash_t(key hash) | pos_t(key adress) | pos_t(next) | data_t(value)]
 
-        static constexpr uint64_t bucket_cell_size
-            = sizeof(state_t) + sizeof(hash_t) + sizeof(pos_t) + sizeof(pos_t) + sizeof(data_t);
+    public:
+        struct Page {
+            struct Segment {
+                state_t state;
+                hash_t hash;
+                pos_t key_adress;
+                data_t value;
+
+                constexpr static Segment get_default() {
+                    return {
+                        seg_state::empty, {}, {}, {}
+                    };
+                }
+            };
+
+            Segment segs[PageLength];
+            uint64_t seg_count;
+            pos_t next_page_pos;
+
+            constexpr static Page get_empty() {
+                Segment segs[PageLength] = {};
+                for (size_t i = 0; i < PageLength; ++i) {
+                    segs[i] = Segment::get_default();
+                }
+                return Page{ {}, 0, 0 };
+            }
+        };
+
+        using Segment = typename Page::Segment;
 
     public:
         FileHashIndex(
@@ -115,7 +139,7 @@ namespace details {
             return inspect(
                 [] (auto *data) -> opt_data_t {
                     if (data) {
-                        return opt_data_t(*data);
+                        return opt_data_t(data->value);
                     }
                     else {
                         return boost::none;
@@ -127,49 +151,36 @@ namespace details {
         }
 
         bool insert(const key_t &key, const data_t &data) {
-            return insert(key, [&]() { return data; }, cell_state::alive);
+            return insert(key, [&]() { return data; });
         }
 
         bool insert(const key_t &key, std::function<data_t ()> get_data) {
-            return insert(key, get_data, cell_state::alive);
+            if (insert(key, get_data, seg_state::alive)) {
+                m_size++;
+                return true;
+            }
+            return false;
         }
 
         bool erase(const key_t &key) {
             auto hash = m_hasher(key);
 
-            auto cell_pos = get_bucket_pos(hash);
-            while (true) {
-                auto state = m_table.read_at<state_t>(cell_pos);
-                if (state == cell_state::empty) {
-                    return false;
-                }
-                if (state != cell_state::dead && state != cell_state::alive) {
-                    throw CorruptedFile();
-                }
-
-                auto cell_hash = fcl::read_val<hash_t>(m_table);
-                if (hash == cell_hash) {
-                    auto cell_key_pos = fcl::read_val<pos_t>(m_table);
-                    if (key == get_key(cell_key_pos)) {
-                        m_table.write_at(cell_pos, cell_state::dead);
+            return inspect(
+                [this](Segment *seg) {
+                    if (seg) {
+                        seg->state = seg_state::dead;
                         m_size--;
                         return true;
                     }
-                }
-                else {
-                    m_table.skip<pos_t>();
-                    auto next_pos = fcl::read_val<pos_t>(m_table);
-                    if (next_pos == pos_t(0)) {
-                        return false;
-                    }
-                    cell_pos = next_pos;
-                }
-            }
-            return false;
+                    return false;
+                },
+                key,
+                hash
+            );
         }
 
         bool has(const key_t &key) const {
-            auto hash = m_hasher(key);
+            auto hash = hasher_t()(key);
             return has(key, hash);
         }
 
@@ -186,17 +197,18 @@ namespace details {
         }
 
         float max_load_factor() const {
-            return m_rehash_threshold;
+            return m_load_factor_threshold;
         }
 
         void set_max_load_factor(const float val) {
             assert(val >= 1.0f);
-            m_rehash_threshold = val;
+            m_load_factor_threshold = val;
         }
 
         bool rehash_if_need() {
             constexpr bool bad_case = sizeof(data_t) < sizeof(hash_t);
-            constexpr bool bad_cond = bad_case ? (bucket_count() / (1 << (sizeof(data_t) * 8))) : false;
+            bool bad_cond = false;
+            if (bad_case) bad_cond = (bucket_count() >> (sizeof(data_t) * 8)); // don't worry, it's ok
             if (load_factor() >= max_load_factor() && !bad_cond) {
                 rehash(bucket_count() * 2);
                 return true;
@@ -206,15 +218,13 @@ namespace details {
         }
 
         void shrink_to_fit() {
-            rehash(uint64_t(std::ceil(float(size()) / m_rehash_threshold)));
+            rehash(uint64_t(std::ceil(float(std::max(size(), uint64_t(1)))) / m_load_factor_threshold));
         }
 
         void rehash(const uint64_t new_bucket_count) {
             assert(new_bucket_count > 0u);
 
-            if (!m_table_file.is_open()) {
-                return; // there is nothing to do here
-            }
+            if (!m_table_file.is_open()) { return; }// there is nothing to do here
 
             m_table_file.close();
             auto old_table_path = m_table_path;
@@ -224,43 +234,36 @@ namespace details {
             init_table(new_bucket_count, true);
 
             std::fstream old_table_file(old_table_path, flags::bin_io_reopen);
-            if (!old_table_file) {
-                throw CannotOpenFile(old_table_path);
-            }
+            if (!old_table_file) { throw CannotOpenFile(old_table_path); }
             bin_stream_t old_table(old_table_file);
 
             old_table.skip(sizeof(m_bucket_count));
 
             try {
+                Page current_page;
                 while (true) {
-                    auto state = fcl::read_val<state_t>(old_table);
-                    if (state == cell_state::empty) {
-                        old_table.skip_n<hash_t, pos_t, pos_t, data_t>();
-                        continue;
-                    }
-
-                    if (state != cell_state::dead && state != cell_state::alive) {
-                        throw CorruptedFile();
-                    }
-                    auto hash = fcl::read_val<hash_t>(old_table);
-                    auto key_adress = fcl::read_val<pos_t>(old_table);
-                    old_table.skip<pos_t>(); // i'm don't care about old structure
-                    auto value = fcl::read_val<data_t>(old_table);
-                    if (!insert(std::make_pair(hash, key_adress), [&]() { return value; }, state)) {
-                        assert(!"Shit happense");
+                    old_table >> current_page;
+                    assert(current_page.seg_count <= PageLength);
+                    for (size_t i = 0; i < current_page.seg_count; ++i) {
+                        Segment &seg = current_page.segs[i];
+                        bool insertion_succeed = insert(
+                            std::make_pair(seg.hash, seg.key_adress),
+                            [&]() { return seg.value; },
+                            seg.state
+                        );
+                        if (!insertion_succeed) {
+                            assert(!"Shit happense");
+                        }
                     }
                 }
             }
-            catch (const fcl::ReadingAtEOF &) {
+            catch (const fcl::ReadingAtEOF &) { // it's ok, end of file successfully reached
                 old_table_file.close();
                 fs::remove(old_table_path);
-                // it's ok, end of file successfully reached
             }
         }
 
     private:
-        // bucket cell structure:
-        // [state_t(state e/a/d) | hash_t(key hash) | pos_t(key adress) | pos_t(next) | data_t(value)]
         const std::hash<key_t> m_hasher{};
         const std::string m_table_path;
         const std::string m_keys_path;
@@ -268,7 +271,7 @@ namespace details {
         mutable std::fstream m_keys_file;
         mutable bin_stream_t m_table{ m_table_file };
         mutable bin_stream_t m_keys{ m_keys_file };
-        float m_rehash_threshold = 2.0f;
+        float m_load_factor_threshold = float(PageLength) * 0.75f;
         uint64_t m_size = 0;
         uint64_t m_bucket_count = 0;
 
@@ -300,51 +303,49 @@ namespace details {
             rehash_if_need();
 
             hash_t hash = boost::apply_visitor(get_hash_visitor(), key);
-
-            pos_t put_next_pos = 0;
-            auto cell_pos = get_bucket_pos(hash);
-
-            auto write_here = [&] () {
-                get_key_pos_visitor get_key_pos(m_keys);
-                auto key_pos = boost::apply_visitor(get_key_pos, key);
-                auto new_pos = m_table.get_pos();
-                m_table << initial_state << hash << key_pos << pos_t(0) << value();
-                if (put_next_pos) {
-                    m_table.write_at(put_next_pos, new_pos);
-                }
-                m_size++;
-            };
-
+            auto page_pos = get_bucket_pos(hash);
+            Page current_page;
             while (true) {
-                auto state = m_table.read_at<state_t>(cell_pos);
+                m_table.set_pos(page_pos);
+                m_table >> current_page;
 
-                if (state == cell_state::empty) {
-                    m_table.set_pos(cell_pos);
-                    write_here();
+                assert(current_page.seg_count <= PageLength);
+                for (size_t i = 0; i < current_page.seg_count; ++i) {
+                    Segment &seg = current_page.segs[i];
+                    if (seg.hash == hash) {
+                        auto keys_eq = cmp_keys_visitor(seg.key_adress, m_keys);
+                        if (boost::apply_visitor(keys_eq, key)) {
+                            if (seg.state == seg_state::dead) { // resurrection
+                                seg.value = value();
+                                seg.state = initial_state;
+                                m_table.write_at(page_pos, current_page);
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+
+                if (current_page.seg_count != PageLength) {
+                    Segment &seg = current_page.segs[current_page.seg_count];
+                    auto get_key_pos = get_key_pos_visitor(m_keys);
+                    seg.hash = hash;
+                    seg.key_adress = boost::apply_visitor(get_key_pos, key);
+                    seg.value = value();
+                    seg.state = initial_state;
+                    current_page.seg_count++;
+                    m_table.write_at(page_pos, current_page);
                     return true;
                 }
-                else if (state == cell_state::dead || state == cell_state::alive) {
-                    auto cell_hash = fcl::read_val<hash_t>(m_table);
-                    if (hash == cell_hash) {
-                        return false;
-                    }
-                    auto cell_key_pos = fcl::read_val<pos_t>(m_table);
-                    cmp_keys_visitor cmp_keys{ cell_key_pos, m_keys };
-                    if (boost::apply_visitor(cmp_keys, key)) { // keys are equal
-                        return false;
-                    }
-                    put_next_pos = m_table.get_pos();
-                    if (auto next_pos = fcl::read_val<pos_t>(m_table)) {
-                        cell_pos = next_pos;
+                else {
+                    if (current_page.next_page_pos != 0) {
+                        page_pos = current_page.next_page_pos;
                     }
                     else {
-                        m_table.goto_end();
-                        write_here();
-                        return true;
+                        pos_t pos_to_connect = page_pos + offsetof(Page, next_page_pos);
+                        page_pos = m_table.append(Page::get_empty());
+                        m_table.write_at(pos_to_connect, page_pos);
                     }
-                }
-                else {
-                    throw CorruptedFile();
                 }
             }
             assert(!"unreachable code!");
@@ -359,12 +360,12 @@ namespace details {
                 m_table.goto_begin();
                 m_table << m_bucket_count;
                 for (uint64_t i = 0; i < initial_bucket_count; ++i) {
-                    m_table << cell_state::empty << hash_t{} << pos_t{} << pos_t{0} << data_t{};
+                    m_table << Page::get_empty();
                 }
             }
             else {
                 m_table.goto_begin();
-                m_bucket_count = fcl::read_val<uint64_t>(m_table);
+                m_table >> m_bucket_count;
             }
         }
 
@@ -372,36 +373,53 @@ namespace details {
             try_to_open(m_keys_path, m_keys_file, overwrite);
         }
 
-        template< typename F > // Functor: Fn<auto (data_t *)>
-        auto inspect(F f, const key_t &key, const hash_t &hash) {
-            return const_cast<const decltype(this)>(this)->inspect(f, key, hash);
-        }
-
         template< typename F > // Functor: Fn<auto (data_t *rec)>
-        auto inspect(F f, const key_t &key, const hash_t &hash) const {
-            m_table.set_pos(get_bucket_pos(hash));
-            auto nothing = [&f] () { return f(static_cast<const data_t *>(nullptr)); };
+        auto inspect(F f, const key_t &key, const hash_t &hash) {
+            auto page_pos = get_bucket_pos(hash);
+            Page current_page;
+            auto nothing = [&f] () { return f(static_cast<Segment *>(nullptr)); };
             while (true) {
-                auto state = fcl::read_val<state_t>(m_table);
-                if (state == cell_state::empty) {
-                    return nothing();
-                }
-                auto cell_hash = fcl::read_val<hash_t>(m_table);
-                if (cell_hash == hash) {
-                    auto cell_key_pos = fcl::read_val<pos_t>(m_table);
-                    if (get_key(cell_key_pos) == key) { // to avoid hash-collisions
-                        m_table.skip<pos_t>(); // skip pos of next cell
-                        auto cell_value = fcl::read_val<data_t>(m_table);
-                        return f(&cell_value);
+                m_table.set_pos(page_pos);
+                m_table >> current_page;
+                assert(current_page.seg_count <= PageLength);
+                for (size_t i = 0; i < current_page.seg_count; ++i) {
+                    Segment &seg = current_page.segs[i];
+                    if (seg.state != seg_state::alive) { continue; }
+                    if (seg.hash == hash) {
+                        if (get_key(seg.key_adress) == key) {
+                            auto write_at_exit = wheels::finally(
+                                [&]() { m_table.write_at(page_pos, current_page); }
+                            );
+                            return f(&seg);
+                        }
                     }
                 }
-                m_table.skip<pos_t>(); // we don't need no key
-                if (auto next_pos = fcl::read_val<pos_t>(m_table)) {
-                    m_table.set_pos(next_pos);
+                if (current_page.next_page_pos == 0) { return nothing(); }
+                page_pos = current_page.next_page_pos;
+            }
+            assert(!"unreaceble code!");
+            return nothing();
+        }
+
+        template< typename F > // Functor: Fn<auto (const Segment *rec)>
+        auto inspect(F f, const key_t &key, const hash_t &hash) const {
+            auto page_pos = get_bucket_pos(hash);
+            auto nothing = [&f] () { return f(static_cast<const Segment *>(nullptr)); };
+            Page current_page;
+            while (true) {
+                m_table.set_pos(page_pos);
+                m_table >> current_page;
+
+                assert(current_page.seg_count <= PageLength);
+                for (size_t i = 0; i < current_page.seg_count; ++i) {
+                    const Segment &seg = current_page.segs[i];
+                    if (seg.state != seg_state::alive) continue;
+                    if (seg.hash == hash) {
+                        if (get_key(seg.key_adress) == key) { return f(&seg); }
+                    }
                 }
-                else {
-                    return nothing();
-                }
+                if (current_page.next_page_pos == 0) { return nothing(); }
+                page_pos = current_page.next_page_pos;
             }
             assert(!"unreaceble code!");
             return nothing();
@@ -413,7 +431,7 @@ namespace details {
 
         pos_t get_bucket_pos(const hash_t hash) const {
             auto number = calc_bucket_number(hash);
-            auto bucket_pos = bucket_cell_size * number + sizeof(m_bucket_count);
+            auto bucket_pos = sizeof(m_bucket_count) + sizeof(Page) * number;
             return bucket_pos;
         }
 
@@ -460,17 +478,19 @@ namespace details {
     };
 }
 
-template <typename Key, typename Value>
+template <typename Key, typename Value, uint64_t PageLength>
 class HashedFile {
     using value_t = Value;
     using opt_value_t = boost::optional<value_t>;
     using key_t = Key;
     using pos_t = std::streamoff;
-    using index_t = details::FileHashIndex<key_t, pos_t>;
+
+public:
+    using index_t = details::FileHashIndex<key_t, pos_t, PageLength>;
     using storage_t = details::FileStorage<value_t>;
 
 public:
-    HashedFile(const details::fs::path &working_dir, bool overwrite = true)
+    HashedFile(const details::fs::path &working_dir, bool overwrite)
         : m_index(working_dir/"hash_idx", working_dir/"keys_idx", overwrite)
         , m_storage(working_dir/"data", overwrite) {}
 
@@ -510,6 +530,18 @@ public:
 
     bool empty() const {
         return size() == 0;
+    }
+
+    const index_t &idxs() const {
+        return m_index;
+    }
+
+    void set_load_factor_threshold(float new_threshold) {
+        m_index.set_max_load_factor(new_threshold);
+    }
+
+    float get_load_factor() const {
+        return m_index.load_factor();
     }
 
 private:
