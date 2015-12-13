@@ -42,7 +42,7 @@ namespace details {
     namespace flags {
         constexpr auto bin_io = std::ios::in | std::ios::out | std::ios::binary;
         constexpr auto bin_io_overwrite = bin_io | std::ios::trunc;
-        constexpr auto bin_io_reopen = bin_io | std::ios::app;
+        constexpr auto bin_io_reopen = bin_io;
     }
 
     inline void try_to_open(const std::string &path, std::fstream &file, bool overwrite) {
@@ -51,9 +51,6 @@ namespace details {
         }
         else {
             file.open(path, flags::bin_io_reopen);
-            if (!file) {
-                file.open(path, flags::bin_io_overwrite);
-            }
         }
 
         if (!file) {
@@ -125,7 +122,7 @@ namespace details {
         ~FileHashIndex() {
             if (m_table_file) {
                 m_table.goto_begin();
-                m_table << m_bucket_count;
+                m_table << m_bucket_count << m_size;
             }
         }
 
@@ -180,7 +177,7 @@ namespace details {
         }
 
         bool has(const key_t &key) const {
-            auto hash = hasher_t()(key);
+            auto hash = m_hasher(key);
             return has(key, hash);
         }
 
@@ -208,7 +205,8 @@ namespace details {
         bool rehash_if_need() {
             constexpr bool bad_case = sizeof(data_t) < sizeof(hash_t);
             bool bad_cond = false;
-            if (bad_case) bad_cond = (bucket_count() >> (sizeof(data_t) * 8)); // don't worry, it's ok
+            if (bad_case) bad_cond =
+                    (bucket_count() >> (sizeof(data_t) * 4)) >> (sizeof(data_t) * 4); // it's ok
             if (load_factor() >= max_load_factor() && !bad_cond) {
                 rehash(bucket_count() * 2);
                 return true;
@@ -218,13 +216,15 @@ namespace details {
         }
 
         void shrink_to_fit() {
-            rehash(uint64_t(std::ceil(float(std::max(size(), uint64_t(1)))) / m_load_factor_threshold));
+            rehash(uint64_t(
+                std::ceil(float(std::max(size(), uint64_t(1)))) / m_load_factor_threshold
+            ));
         }
 
         void rehash(const uint64_t new_bucket_count) {
             assert(new_bucket_count > 0u);
 
-            if (!m_table_file.is_open()) { return; }// there is nothing to do here
+            if (!m_table_file.is_open()) { return; } // there is nothing to do here
 
             m_table_file.close();
             auto old_table_path = m_table_path;
@@ -238,6 +238,7 @@ namespace details {
             bin_stream_t old_table(old_table_file);
 
             old_table.skip(sizeof(m_bucket_count));
+            old_table.skip(sizeof(m_size));
 
             try {
                 Page current_page;
@@ -264,9 +265,9 @@ namespace details {
         }
 
     private:
-        const std::hash<key_t> m_hasher{};
-        const std::string m_table_path;
-        const std::string m_keys_path;
+        std::hash<key_t> m_hasher{};
+        std::string m_table_path;
+        std::string m_keys_path;
         mutable std::fstream m_table_file;
         mutable std::fstream m_keys_file;
         mutable bin_stream_t m_table{ m_table_file };
@@ -280,7 +281,7 @@ namespace details {
             bin_stream_t &m_keys;
             get_key_pos_visitor(bin_stream_t &keys) : m_keys(keys) {}
             pos_t operator()(key_info_t val) { return val.second; }
-            pos_t operator()(key_t key) { return m_keys.write(key); }
+            pos_t operator()(key_t key) { return m_keys.append(key); }
         };
 
         struct cmp_keys_visitor : boost::static_visitor<bool> {
@@ -358,14 +359,14 @@ namespace details {
             if (overwrite) {
                 m_bucket_count = initial_bucket_count;
                 m_table.goto_begin();
-                m_table << m_bucket_count;
+                m_table << m_bucket_count << m_size;
                 for (uint64_t i = 0; i < initial_bucket_count; ++i) {
                     m_table << Page::get_empty();
                 }
             }
             else {
                 m_table.goto_begin();
-                m_table >> m_bucket_count;
+                m_table >> m_bucket_count >> m_size;
             }
         }
 
@@ -431,7 +432,7 @@ namespace details {
 
         pos_t get_bucket_pos(const hash_t hash) const {
             auto number = calc_bucket_number(hash);
-            auto bucket_pos = sizeof(m_bucket_count) + sizeof(Page) * number;
+            auto bucket_pos = sizeof(m_bucket_count) + sizeof(m_size) + sizeof(Page) * number;
             return bucket_pos;
         }
 
@@ -469,7 +470,7 @@ namespace details {
         }
 
         pos_t insert(const value_t &val) {
-            return m_storage.write(val);
+            return m_storage.append(val);
         }
 
     private:
@@ -520,7 +521,7 @@ public:
         return m_index.erase(key);
     }
 
-    bool has(const key_t &key) {
+    bool has(const key_t &key) const {
         return m_index.has(key);
     }
 

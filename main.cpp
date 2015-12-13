@@ -6,7 +6,9 @@
 #include <iterator>
 #include <random>
 #include <vector>
-#include <unordered_map>
+#include <map>
+#include <functional>
+#include <memory>
 
 #include <wheels/stopwatch.h++>
 
@@ -48,8 +50,19 @@ double to_ms(Ty t) {
     );
 }
 
+std::string read_line(std::istream &is) {
+    std::string out;
+    std::getline(is, out, '\n');
+    return out;
+}
+
 template <typename HashedFileTy, typename KeysTy, typename ValuesTy>
-void test_insertion(std::ostream &out, const size_t N, HashedFileTy &hfile, KeysTy &keys, ValuesTy &values) {
+void test_insertion(
+        std::ostream &out,
+        const size_t N,
+        HashedFileTy &hfile,
+        KeysTy &keys,
+        ValuesTy &values) {
     auto insertion_duration = wheels::time_execution(
         [&] { for (size_t i = 0; i < N; ++i) {
                   hfile.insert(keys[i], values[i]);
@@ -60,7 +73,12 @@ void test_insertion(std::ostream &out, const size_t N, HashedFileTy &hfile, Keys
 }
 
 template <typename HashedFileTy, typename KeysTy, typename ValuesTy>
-void test_search(std::ostream &out, const size_t N, HashedFileTy &hfile, KeysTy &keys, ValuesTy &values) {
+void test_search(
+        std::ostream &out,
+        const size_t N,
+        HashedFileTy &hfile,
+        KeysTy &keys,
+        ValuesTy &values) {
     std::uniform_int_distribution<> dist(0, N-1);
     size_t found = 0;
     auto search_duration = wheels::time_execution(
@@ -72,11 +90,17 @@ void test_search(std::ostream &out, const size_t N, HashedFileTy &hfile, KeysTy 
                       if (hfile.has(values[dist(rng)])) found++;
                   }
               }});
-    out << "search avg: " << to_mcs(search_duration) / N << " mcs (" << found << " found)" << std::endl;
+    out << "search avg: " << to_mcs(search_duration) / N << " mcs "
+        << "(" << found << " found)" << std::endl;
 }
 
 template <typename HashedFileTy, typename KeysTy, typename ValuesTy>
-void test_deletion(std::ostream &out, const size_t N, HashedFileTy &hfile, KeysTy &keys, ValuesTy &) {
+void test_deletion(
+        std::ostream &out,
+        const size_t N,
+        HashedFileTy &hfile,
+        KeysTy &keys,
+        ValuesTy &) {
     std::uniform_int_distribution<> dist(0, N-1);
     auto deletion_duration = wheels::time_execution(
         [&] { for (size_t i = 0; i < N; ++i) {
@@ -91,7 +115,8 @@ template <size_t M>
 void test(std::ostream &out, const size_t N) {
     out << "N: " << N << " M: " << M << std::endl;
     using hashed_file = HashedFile<std::string, std::string, M>;
-    hashed_file hfile("./", true);
+    details::fs::create_directory("./test");
+    hashed_file hfile("./test", true);
     std::vector<std::string> keys;
     std::vector<std::string> values;
 
@@ -99,7 +124,7 @@ void test(std::ostream &out, const size_t N) {
         [&] { keys = gen_strings<10>(N);
               values = gen_strings<10>(N); });
 
-    out << "gen: " << to_ms(gen_duration) << " ms;\n";
+    out << "generation: " << to_ms(gen_duration) << " ms;\n";
     out << "page size: " << sizeof(typename hashed_file::index_t::Page) << " bytes" << std::endl;
 
     test_insertion(out, N, hfile, keys, values);
@@ -107,6 +132,7 @@ void test(std::ostream &out, const size_t N) {
     test_deletion(out, N, hfile, keys, values);
 
     out << "\n\n";
+    details::fs::remove_all("./test");
 }
 
 template <size_t MHead>
@@ -129,7 +155,160 @@ void tests(std::ostream &out, const std::vector<size_t> Ns) {
     }
 }
 
+using action_t = std::function<void ()>;
+using action_map_t = std::map<std::string, action_t>;
+using hash_storage_t = HashedFile<std::string, std::string, 6>;
+using opt_hash_storage_t = std::unique_ptr<hash_storage_t>;
+
+class EmptyOptional : public std::exception {
+public:
+    EmptyOptional(const std::string &error)
+        : m_message("optional is empty: [" + error + "]") {}
+
+    virtual const char *what() const noexcept override {
+        return m_message.c_str();
+    }
+private:
+    const std::string m_message;
+};
+
+class NoSuchValue : public std::exception {
+public:
+    NoSuchValue(const std::string &error)
+        : m_message("no such value: [" + error + "]") {}
+
+    virtual const char *what() const noexcept override {
+        return m_message.c_str();
+    }
+private:
+    const std::string m_message;
+};
+
+class Exit : public std::exception {
+public:
+    virtual const char *what() const noexcept override {
+        return "";
+    }
+};
+
+template <typename Ty>
+Ty &ref_or_err(std::unique_ptr<Ty> &opt, std::string msg) {
+    if (!opt) {
+        throw EmptyOptional(msg);
+    }
+    return *opt.get();
+}
+
+template <typename Ty, typename Exc>
+Ty value_or_exc(boost::optional<Ty> &opt, Exc err) {
+    if (opt.is_initialized()) {
+        return opt.get();
+    }
+    throw err;
+}
+
+void flush_line(std::istream &is) {
+    std::string tmp;
+    std::getline(is, tmp);
+}
+
 int main() {
-    tests<10, 100, 1000>(std::cout, {1000, 10000, 100000, 1000000});
+    opt_hash_storage_t hfile;
+    action_map_t action_map = {
+        { "run_tests", [&] { tests<10, 100, 1000>(std::cout, {1000, 10000, 100000, 1000000}); } },
+
+        { "stats", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
+                         std::cout << "size: " << active_db.idxs().size() << std::endl
+                            << "bucket count: " << active_db.idxs().bucket_count() << std::endl
+                            << "load factor: " << active_db.idxs().load_factor() << std::endl; } },
+
+        { "load_db", [&] { std::cout << "Enter directory to load from → ";
+                           auto dir = fcl::read_val<std::string>(std::cin);
+                           hfile = std::make_unique<hash_storage_t>(dir, false); } },
+
+        { "create_db", [&] { std::cout << "Enter directory to create → ";
+                             auto dir = fcl::read_val<std::string>(std::cin);
+                             if (!details::fs::is_directory(dir)) {
+                                 details::fs::create_directories(dir);
+                             }
+                             hfile = std::make_unique<hash_storage_t>(dir, true); } },
+
+        { "insert", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
+                          std::cout << "Enter key ↓" << std::endl;
+                          flush_line(std::cin);
+                          auto key = read_line(std::cin);
+                          std::cout << "Enter value ↓" << std::endl;
+                          auto value = read_line(std::cin);
+                          if (!active_db.insert(key, value)) {
+                              std::cout << "Cannot insert: key already binded\n";
+                          }
+                          auto val = active_db.get(key);
+                          std::cout << "pair (" << key << ", " << value_or_exc(
+                              val, NoSuchValue("associated value not found")) << ")"
+                          << " added" << std::endl; } },
+
+        { "get", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
+                       std::cout << "Enter associated key ↓" << std::endl;
+                       flush_line(std::cin);
+                       auto key = read_line(std::cin);
+                       auto value = active_db.get(key);
+                       std::cout << value_or_exc(
+                           value, NoSuchValue("associated value not found")) << std::endl; } },
+
+        { "has", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
+                       std::cout << "Enter associated key ↓" << std::endl;
+                       flush_line(std::cin);
+                       auto key = read_line(std::cin);
+                       auto has = active_db.has(key);
+                       std::cout << (has ? "key exists"
+                                         : "no such key") << std::endl; } },
+
+        { "remove", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
+                          std::cout << "Enter associated key ↓" << std::endl;
+                          flush_line(std::cin);
+                          auto key = read_line(std::cin);
+                          auto result = active_db.erase(key);
+                          std::cout << (result ? "value successfuly removed"
+                                               : "no associated values") << std::endl; } },
+
+        { "close_db", [&] { std::cout << "Are you sure? (y/n) ";
+                            auto answ = fcl::read_val<char>(std::cin);
+                            if (answ == 'y') { hfile.reset(nullptr); } } },
+
+        { "exit", [&] { throw Exit(); } },
+    };
+
+    std::cout << "What do you want to do? \"help\" to see avialable commands" << std::endl;
+    while (true) {
+        try {
+            std::cout << " → ";
+            auto command = fcl::read_val<std::string>(std::cin);
+            if (command == "help") {
+                for (auto &action : action_map) { std::cout << action.first << std::endl; }
+                continue;
+            }
+            else {
+                auto it = action_map.find(command);
+                if (it == action_map.end()) {
+                    std::cout << "No such command" << std::endl;
+                    continue;
+                }
+                it->second();
+            }
+        }
+        catch (const Exit &) { break; }
+        catch (const NoSuchValue &err) { std::cout << "Sorry, " << err.what() << std::endl; }
+        catch (const EmptyOptional &err) { std::cout << err.what() << std::endl; }
+        catch (const details::CannotOpenFile &err) { std::cout << err.what() << std::endl; }
+        catch (const std::exception &err) {
+            std::cout << "Exception: " << err.what() << std::endl;
+            return 1;
+        }
+        catch (...) {
+            std::cout << "Caught unknown exception" << std::endl;
+            return 2;
+        }
+    }
+
     return 0;
 }
