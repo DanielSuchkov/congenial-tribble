@@ -10,6 +10,9 @@
 \usepackage{unicode-math}
 \setmainfont{FreeSerif.otf}
 
+\setmainlanguage{russian}
+\PolyglossiaSetup{russian}{indentfirst=true}
+
 \usepackage{setspace}
 \usepackage{fancyhdr}
 \usepackage{ucs}
@@ -42,7 +45,7 @@
     keepspaces=true,                 % keeps spaces in text, useful for keeping indentation of code (possibly needs columns=flexible)
     keywordstyle=\color{blue},       % keyword style
     morekeywords={*,...},            % if you want to add more keywords to the set
-    numbers=left,                    % where to put the line-numbers; possible values are (none, left, right)
+    numbers=none,                    % where to put the line-numbers; possible values are (none, left, right)
     numberstyle=\consolas\color{mygray}, % the style that is used for the line-numbers
     rulecolor=\color{black},         % if not set, the frame-color may be changed on line-breaks within not-black text (e.g. comments (green here))
     showspaces=false,                % show spaces everywhere adding particular underscores; it overrides 'showstringspaces'
@@ -63,8 +66,9 @@
 }
 \newcommand{\graphlinewidth}[1]{\pgfplotsset{every axis/.append style={line width=#1}}}
 
-\parindent = 1cm
-\onehalfspacing
+\setlength{\parskip}{1em}
+\parindent = 1.5cm
+\linespread{1.6}
 
 \fancypagestyle{firststyle} {
     \renewcommand{\headrulewidth}{0.0pt}
@@ -81,7 +85,7 @@
         \let \footnotesize \small
         \let \footnoterule \relax
         \let \footnote \thanks
-        
+
         \fancyhead[C]{\small \@where}
         \null\vfil
         \vskip 60\p@
@@ -99,9 +103,9 @@
             \fancyfoot[C]{\small \@date}
             \vfil\null
         \end{titlepage}
-        
+
         \setcounter{footnote}{0}
-        
+
         \global\let\thanks\relax
         \global\let\maketitle\relax
         \global\let\@thanks\@empty
@@ -113,7 +117,7 @@
         \global\let\date\relax
         \global\let\and\relax
     }
-    
+
     \fancypagestyle{otherpages} {
         \fancyhead{}
         \fancyfoot{}
@@ -123,6 +127,6 @@
         \cfoot{\@empty}
         \rfoot{\thepage}
     }
-    
+
     \pagestyle{otherpages}
-    
+

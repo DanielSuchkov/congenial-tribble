@@ -1,5 +1,4 @@
 #include <iostream>
-#include "hash_file_storage.hpp"
 #include <functional>
 #include <algorithm>
 #include <string>
@@ -12,8 +11,14 @@
 
 #include <wheels/stopwatch.h++>
 
-std::random_device rd;
-std::default_random_engine rng(rd());
+#include "hash_file_storage.hpp"
+
+
+auto &rng() {
+    static std::random_device rd;
+    static std::default_random_engine rng(rd());
+    return rng;
+}
 
 template <size_t StringLength>
 std::vector<std::string> gen_strings(const size_t count) {
@@ -22,15 +27,15 @@ std::vector<std::string> gen_strings(const size_t count) {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         "0123456789";
 
-    std::uniform_int_distribution<> dist(0,sizeof(alphabet)/sizeof(*alphabet)-2);
+    std::uniform_int_distribution<> dist(0, sizeof(alphabet) / sizeof(*alphabet) - 2);
 
     std::vector<std::string> strs;
     strs.reserve(count);
     std::generate_n(std::back_inserter(strs), strs.capacity(),
         [&] { std::string str;
-              str.reserve(StringLength+1);
+              str.reserve(StringLength + 1);
               std::generate_n(std::back_inserter(str), StringLength,
-                   [&] { return alphabet[dist(rng)];});
+                   [&] { return alphabet[dist(rng())]; });
               str += "\0";
               return str; });
     return strs;
@@ -84,10 +89,10 @@ void test_search(
     auto search_duration = wheels::time_execution(
         [&] { for (size_t i = 0; i < N; ++i) {
                   if (i % 2) {
-                      if (hfile.has(keys[dist(rng)])) found++;
+                      if (hfile.has(keys[dist(rng())])) found++;
                   }
                   else {
-                      if (hfile.has(values[dist(rng)])) found++;
+                      if (hfile.has(values[dist(rng())])) found++;
                   }
               }});
     out << "search avg: " << to_mcs(search_duration) / N << " mcs "
@@ -105,7 +110,7 @@ void test_deletion(
     auto deletion_duration = wheels::time_execution(
         [&] { for (size_t i = 0; i < N; ++i) {
                   if (i % 2) {
-                      hfile.erase(keys[dist(rng)]);
+                      hfile.erase(keys[dist(rng())]);
                   }
               }});
     out << "del avg: " << to_mcs(deletion_duration) / N << " mcs" << std::endl;
@@ -207,7 +212,7 @@ Ty value_or_exc(boost::optional<Ty> &opt, Exc err) {
     throw err;
 }
 
-void flush_line(std::istream &is) {
+void ignore_line(std::istream &is) {
     std::string tmp;
     std::getline(is, tmp);
 }
@@ -219,8 +224,10 @@ int main() {
 
         { "stats", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
                          std::cout << "size: " << active_db.idxs().size() << std::endl
-                            << "bucket count: " << active_db.idxs().bucket_count() << std::endl
-                            << "load factor: " << active_db.idxs().load_factor() << std::endl; } },
+                            << "bucket`count: " << active_db.idxs().bucket_count() << std::endl
+                            << "load factor: " << active_db.idxs().load_factor() << std::endl
+                            << "page size: " << sizeof(typename hash_storage_t::index_t::Page)
+                            << " bytes" << std::endl; } },
 
         { "load_db", [&] { std::cout << "Enter directory to load from → ";
                            auto dir = fcl::read_val<std::string>(std::cin);
@@ -235,7 +242,7 @@ int main() {
 
         { "insert", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
                           std::cout << "Enter key ↓" << std::endl;
-                          flush_line(std::cin);
+                          ignore_line(std::cin);
                           auto key = read_line(std::cin);
                           std::cout << "Enter value ↓" << std::endl;
                           auto value = read_line(std::cin);
@@ -249,7 +256,7 @@ int main() {
 
         { "get", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
                        std::cout << "Enter associated key ↓" << std::endl;
-                       flush_line(std::cin);
+                       ignore_line(std::cin);
                        auto key = read_line(std::cin);
                        auto value = active_db.get(key);
                        std::cout << value_or_exc(
@@ -257,7 +264,7 @@ int main() {
 
         { "has", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
                        std::cout << "Enter associated key ↓" << std::endl;
-                       flush_line(std::cin);
+                       ignore_line(std::cin);
                        auto key = read_line(std::cin);
                        auto has = active_db.has(key);
                        std::cout << (has ? "key exists"
@@ -265,15 +272,16 @@ int main() {
 
         { "remove", [&] { auto &active_db = ref_or_err(hfile, "no active db found");
                           std::cout << "Enter associated key ↓" << std::endl;
-                          flush_line(std::cin);
+                          ignore_line(std::cin);
                           auto key = read_line(std::cin);
                           auto result = active_db.erase(key);
                           std::cout << (result ? "value successfuly removed"
                                                : "no associated values") << std::endl; } },
 
-        { "close_db", [&] { std::cout << "Are you sure? (y/n) ";
-                            auto answ = fcl::read_val<char>(std::cin);
-                            if (answ == 'y') { hfile.reset(nullptr); } } },
+        { "close_db", [&] { hfile.reset(nullptr); } },
+
+        { "help", [&] { for (auto &action : action_map) {
+                            std::cout << action.first << std::endl; } } },
 
         { "exit", [&] { throw Exit(); } },
     };
@@ -283,18 +291,12 @@ int main() {
         try {
             std::cout << " → ";
             auto command = fcl::read_val<std::string>(std::cin);
-            if (command == "help") {
-                for (auto &action : action_map) { std::cout << action.first << std::endl; }
+            auto it = action_map.find(command);
+            if (it == action_map.end()) {
+                std::cout << "No such command. Enter \"help\" to see avialable commands" << std::endl;
                 continue;
             }
-            else {
-                auto it = action_map.find(command);
-                if (it == action_map.end()) {
-                    std::cout << "No such command" << std::endl;
-                    continue;
-                }
-                it->second();
-            }
+            it->second();
         }
         catch (const Exit &) { break; }
         catch (const NoSuchValue &err) { std::cout << "Sorry, " << err.what() << std::endl; }

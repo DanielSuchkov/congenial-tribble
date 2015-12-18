@@ -10,8 +10,6 @@
 #include <boost/optional.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/variant.hpp>
-#include <boost/tuple/tuple.hpp>
-
 #define WHEELS_HAS_FEATURE_CXX_ALIGNED_UNION
 #include <wheels/scope.h++>
 
@@ -31,6 +29,13 @@ namespace details {
         }
     private:
         const std::string m_message;
+    };
+
+    class IncompatableFormat : public std::exception {
+    public:
+        virtual const char *what() const noexcept override {
+            return "this table has incompatible format!";
+        }
     };
 
     namespace seg_state {
@@ -77,6 +82,7 @@ namespace details {
         using bin_stream_t = fcl::BinIOStreamWrap<std::fstream>;
         using key_info_t = std::pair<hash_t, pos_t>;
         using key_variant_t = boost::variant<key_t, key_info_t>;
+        //    ^ i need it to process both new records and old ones (which already in table)
 
     public:
         struct Page {
@@ -87,9 +93,7 @@ namespace details {
                 data_t value;
 
                 constexpr static Segment get_default() {
-                    return {
-                        seg_state::empty, {}, {}, {}
-                    };
+                    return { seg_state::empty, {}, {}, {} };
                 }
             };
 
@@ -98,11 +102,7 @@ namespace details {
             pos_t next_page_pos;
 
             constexpr static Page get_empty() {
-                Segment segs[PageLength] = {};
-                for (size_t i = 0; i < PageLength; ++i) {
-                    segs[i] = Segment::get_default();
-                }
-                return Page{ {}, 0, 0 };
+                return { {}, 0, 0 };
             }
         };
 
@@ -121,8 +121,9 @@ namespace details {
 
         ~FileHashIndex() {
             if (m_table_file) {
+                // it's important: save structure's state before exit
                 m_table.goto_begin();
-                m_table << m_bucket_count << m_size;
+                m_table << m_bucket_count << m_size << PageLength;
             }
         }
 
@@ -134,23 +135,21 @@ namespace details {
 
         opt_data_t get(const key_t &key) const {
             return inspect(
-                [] (auto *data) -> opt_data_t {
-                    if (data) {
-                        return opt_data_t(data->value);
-                    }
-                    else {
-                        return boost::none;
-                    }
-                },
                 key,
-                m_hasher(key)
+                m_hasher(key),
+                [] (auto *data) -> opt_data_t {
+                    if (data) { return opt_data_t(data->value); }
+                    else { return boost::none; }
+                }
             );
         }
 
+        // this (unlike the next one) for usual case
         bool insert(const key_t &key, const data_t &data) {
             return insert(key, [&]() { return data; });
         }
 
+        // useful if you don't want to give me any data when unable to insert it
         bool insert(const key_t &key, std::function<data_t ()> get_data) {
             if (insert(key, get_data, seg_state::alive)) {
                 m_size++;
@@ -161,8 +160,10 @@ namespace details {
 
         bool erase(const key_t &key) {
             auto hash = m_hasher(key);
-
+            // to erase just turn `state` to `dead` and decrease counter
             return inspect(
+                key,
+                hash,
                 [this](Segment *seg) {
                     if (seg) {
                         seg->state = seg_state::dead;
@@ -170,15 +171,14 @@ namespace details {
                         return true;
                     }
                     return false;
-                },
-                key,
-                hash
+                }
             );
         }
 
         bool has(const key_t &key) const {
             auto hash = m_hasher(key);
-            return has(key, hash);
+            // if `inspect` gave us any segment, it obviously exists
+            return inspect(key, hash, [](auto *seg) { return seg != nullptr; });
         }
 
         uint64_t bucket_count() const {
@@ -190,7 +190,8 @@ namespace details {
         }
 
         float load_factor() const {
-            return float(std::max(size(), uint64_t(1))) / bucket_count();
+            auto pseudo_size = std::max(size(), uint64_t(1)); // cause i don't want to get 0
+            return float(pseudo_size) / bucket_count();
         }
 
         float max_load_factor() const {
@@ -216,8 +217,9 @@ namespace details {
         }
 
         void shrink_to_fit() {
-            rehash(uint64_t(
-                std::ceil(float(std::max(size(), uint64_t(1)))) / m_load_factor_threshold
+            auto pseudo_size = std::max(size(), uint64_t(1)); // cause i don't want to get 0
+            rehash(uint64_t( // to exactly fill the new storage
+                std::ceil(float(pseudo_size)) / m_load_factor_threshold
             ));
         }
 
@@ -226,6 +228,7 @@ namespace details {
 
             if (!m_table_file.is_open()) { return; } // there is nothing to do here
 
+            // close current table, rename it to old, open it, create fresh table to replace old one
             m_table_file.close();
             auto old_table_path = m_table_path;
             old_table_path += "_old";
@@ -236,15 +239,16 @@ namespace details {
             std::fstream old_table_file(old_table_path, flags::bin_io_reopen);
             if (!old_table_file) { throw CannotOpenFile(old_table_path); }
             bin_stream_t old_table(old_table_file);
+            // ^ done
 
-            old_table.skip(sizeof(m_bucket_count));
-            old_table.skip(sizeof(m_size));
+            // don't care about old table's parameters
+            old_table.skip_n<uint64_t, uint64_t, uint64_t>();
 
             try {
                 Page current_page;
                 while (true) {
                     old_table >> current_page;
-                    assert(current_page.seg_count <= PageLength);
+                    assert(current_page.seg_count <= PageLength); // smth wrong!
                     for (size_t i = 0; i < current_page.seg_count; ++i) {
                         Segment &seg = current_page.segs[i];
                         bool insertion_succeed = insert(
@@ -257,7 +261,7 @@ namespace details {
                         }
                     }
                 }
-            }
+            } // it's strange to use exceptions as eof check, but it's simpliest way here
             catch (const fcl::ReadingAtEOF &) { // it's ok, end of file successfully reached
                 old_table_file.close();
                 fs::remove(old_table_path);
@@ -268,15 +272,21 @@ namespace details {
         std::hash<key_t> m_hasher{};
         std::string m_table_path;
         std::string m_keys_path;
+
+        // they mutable 'cause i want to make get(...) and has(...) const
         mutable std::fstream m_table_file;
         mutable std::fstream m_keys_file;
         mutable bin_stream_t m_table{ m_table_file };
         mutable bin_stream_t m_keys{ m_keys_file };
+
+         // bad for speed, but good for memory (~80mb against 3.5+ gb on the last test!)
         float m_load_factor_threshold = float(PageLength) * 0.75f;
+
         uint64_t m_size = 0;
         uint64_t m_bucket_count = 0;
 
     private:
+        // in the name of fun and performance
         struct get_key_pos_visitor : boost::static_visitor<pos_t> {
             bin_stream_t &m_keys;
             get_key_pos_visitor(bin_stream_t &keys) : m_keys(keys) {}
@@ -315,8 +325,10 @@ namespace details {
                     Segment &seg = current_page.segs[i];
                     if (seg.hash == hash) {
                         auto keys_eq = cmp_keys_visitor(seg.key_adress, m_keys);
+                        // if we already have one with such key, let's resurrect it
                         if (boost::apply_visitor(keys_eq, key)) {
                             if (seg.state == seg_state::dead) { // resurrection
+                                // other data are the same
                                 seg.value = value();
                                 seg.state = initial_state;
                                 m_table.write_at(page_pos, current_page);
@@ -327,6 +339,7 @@ namespace details {
                     }
                 }
 
+                // ok, it isn't the end of page, we can go on
                 if (current_page.seg_count != PageLength) {
                     Segment &seg = current_page.segs[current_page.seg_count];
                     auto get_key_pos = get_key_pos_visitor(m_keys);
@@ -343,6 +356,7 @@ namespace details {
                         page_pos = current_page.next_page_pos;
                     }
                     else {
+                        // next page need to know where it can put it's adress
                         pos_t pos_to_connect = page_pos + offsetof(Page, next_page_pos);
                         page_pos = m_table.append(Page::get_empty());
                         m_table.write_at(pos_to_connect, page_pos);
@@ -359,7 +373,9 @@ namespace details {
             if (overwrite) {
                 m_bucket_count = initial_bucket_count;
                 m_table.goto_begin();
-                m_table << m_bucket_count << m_size;
+                m_table << m_bucket_count << m_size << PageLength;
+
+                // init a number of empty buckets
                 for (uint64_t i = 0; i < initial_bucket_count; ++i) {
                     m_table << Page::get_empty();
                 }
@@ -367,6 +383,10 @@ namespace details {
             else {
                 m_table.goto_begin();
                 m_table >> m_bucket_count >> m_size;
+                auto pageLength = fcl::read_val<uint64_t>(m_table);
+                if (pageLength != PageLength) {
+                    throw IncompatableFormat();
+                }
             }
         }
 
@@ -374,8 +394,9 @@ namespace details {
             try_to_open(m_keys_path, m_keys_file, overwrite);
         }
 
-        template< typename F > // Functor: Fn<auto (data_t *rec)>
-        auto inspect(F f, const key_t &key, const hash_t &hash) {
+        // this one different from `const` version in: it's remembers any modifications in segment
+        template <typename F> // Functor: Fn<auto (data_t *rec)>
+        auto inspect(const key_t &key, const hash_t &hash, F f) {
             auto page_pos = get_bucket_pos(hash);
             Page current_page;
             auto nothing = [&f] () { return f(static_cast<Segment *>(nullptr)); };
@@ -385,16 +406,18 @@ namespace details {
                 assert(current_page.seg_count <= PageLength);
                 for (size_t i = 0; i < current_page.seg_count; ++i) {
                     Segment &seg = current_page.segs[i];
+                    // if it's not alive, just continue searching
                     if (seg.state != seg_state::alive) { continue; }
                     if (seg.hash == hash) {
                         if (get_key(seg.key_adress) == key) {
-                            auto write_at_exit = wheels::finally(
+                            auto write_at_exit = wheels::finally( // to remember any modifications
                                 [&]() { m_table.write_at(page_pos, current_page); }
                             );
                             return f(&seg);
                         }
                     }
                 }
+                // this is the end, my only friend. the end…
                 if (current_page.next_page_pos == 0) { return nothing(); }
                 page_pos = current_page.next_page_pos;
             }
@@ -402,8 +425,9 @@ namespace details {
             return nothing();
         }
 
-        template< typename F > // Functor: Fn<auto (const Segment *rec)>
-        auto inspect(F f, const key_t &key, const hash_t &hash) const {
+        // same as above, but faster 'cause it can't remember what you have done
+        template <typename F> // Functor: Fn<auto (const Segment *rec)>
+        auto inspect(const key_t &key, const hash_t &hash, F f) const {
             auto page_pos = get_bucket_pos(hash);
             auto nothing = [&f] () { return f(static_cast<const Segment *>(nullptr)); };
             Page current_page;
@@ -426,19 +450,16 @@ namespace details {
             return nothing();
         }
 
-        bool has(const key_t &key, const hash_t &hash) const {
-            return inspect([](auto *rec) { return rec != nullptr; }, key, hash);
-        }
-
         pos_t get_bucket_pos(const hash_t hash) const {
             auto number = calc_bucket_number(hash);
-            auto bucket_pos = sizeof(m_bucket_count) + sizeof(m_size) + sizeof(Page) * number;
+            auto header_size = sizeof(m_bucket_count) + sizeof(m_size) + sizeof(PageLength);
+            auto bucket_pos = header_size + sizeof(Page) * number;
             return bucket_pos;
         }
 
         uint64_t calc_bucket_number(const hash_t hash) const {
             assert(bucket_count() != 0);
-            return hash % bucket_count();
+            return hash % bucket_count(); // simpliest way to do it
         }
 
         key_t get_key(pos_t key_pos) const {
@@ -447,7 +468,7 @@ namespace details {
     };
 
     template <typename Value>
-    class FileStorage {
+    class FileStorage { // simple class, but in the name of SOLID i need it
     public:
         using value_t = Value;
         using pos_t = std::streamoff;
@@ -508,7 +529,7 @@ public:
     }
 
     opt_value_t get(const key_t &key) const {
-        auto pos_opt = m_index.get(key);
+        auto pos_opt = m_index.get(key); // return value only if hash-table said 'yes'
         if (pos_opt) {
             return m_storage.get(pos_opt.get());
         }
